@@ -1,12 +1,34 @@
 /**
  * Torrent Plugin
- * Parses .torrent files and extracts metadata
+ *
+ * Parses .torrent files and extracts metadata including:
+ * - Announce URLs
+ * - Torrent name and files
+ * - Creation info
+ * - Video file metadata from the torrent
+ *
+ * Matches old TorrentProcessor output:
+ * - announce, announceList (add), comment, createdBy, creationDate
+ * - info/files/{n}/length, info/files/{n}/path, info/name
  */
 
 import { readFile } from 'fs/promises';
 import bencode from 'bencode';
+import { FileType, FileNameVideoMetaExtractor, episodePatterns, seasonAndEpisodePatterns, seasonPatterns, extraEpKeyWords, keywordsArray, substringArray, soloEp } from '@metazla/filename-tools';
 import type { PluginManifest, ProcessRequest, CallbackPayload } from './types.js';
 import { MetaCoreClient } from './meta-core-client.js';
+
+const fileType = new FileType();
+const fileNameMetaExtractor = new FileNameVideoMetaExtractor(
+    [],
+    episodePatterns,
+    seasonAndEpisodePatterns,
+    seasonPatterns,
+    extraEpKeyWords,
+    keywordsArray,
+    substringArray,
+    soloEp
+);
 
 export const manifest: PluginManifest = {
     id: 'torrent',
@@ -39,6 +61,7 @@ export async function process(
     try {
         const { cid, filePath, existingMeta } = request;
 
+        // Only process torrent files
         if (existingMeta?.fileType !== 'torrent') {
             await sendCallback({
                 taskId: request.taskId,
@@ -49,35 +72,57 @@ export async function process(
             return;
         }
 
+        // Read and parse torrent file
         const torrentData = await readFile(filePath);
         const parsed = bencode.decode(torrentData, 'utf8') as Record<string, any>;
         const metadata: Record<string, string> = {};
 
-        // Main announce URL
+        // Getting the filename and try to parse video info
+        let fileName = 'undefined';
+        try {
+            fileName = parsed.info?.name?.toString?.() || 'undefined';
+            const torrentFileType = fileType.getFileTypeFromExtension(fileName);
+            if (torrentFileType === 'video') {
+                // Use the same method as old processor - extract video metadata from torrent name
+                const videoMeta = fileNameMetaExtractor.extractVideoFileMetadata(fileName);
+                if (videoMeta.originalTitle) metadata.originalTitle = videoMeta.originalTitle;
+                if (videoMeta.season) metadata.season = videoMeta.season;
+                if (videoMeta.episode) metadata.episode = videoMeta.episode;
+                if (videoMeta.movieYear) metadata.movieYear = videoMeta.movieYear;
+                if (videoMeta.videoType) metadata.videoType = videoMeta.videoType;
+            }
+        } catch (e) {
+            // Ignore multi-file torrent parsing errors
+            console.debug(`[torrent] Could not parse video metadata from torrent name: ${e}`);
+        }
+
+        // Extract main announce URL
         const announce = parsed.announce?.toString?.();
-        if (announce) metadata.announce = announce;
+        if (announce) {
+            metadata.announce = announce;
+        }
 
-        // Torrent name
-        const name = parsed.info?.name?.toString?.();
-        if (name) metadata['info/name'] = name;
-
-        // Optional metadata
+        // Extract optional metadata
         const comment = parsed.comment?.toString?.();
-        if (comment) metadata.comment = comment;
+        if (comment) {
+            metadata.comment = comment;
+        }
 
         const createdBy = parsed['created by']?.toString?.();
-        if (createdBy) metadata.createdBy = createdBy;
+        if (createdBy) {
+            metadata.createdBy = createdBy;
+        }
 
         const creationDate = parsed['creation date'];
         if (creationDate != null) {
             metadata.creationDate = String(creationDate);
         }
 
-        // Files info
-        const files = parsed.info?.files;
-        if (files) {
+        // Extract info section - files
+        try {
+            const files = parsed.info?.files;
             let i = 0;
-            for (const key in files) {
+            for (const key in files || {}) {
                 const file = files[key];
                 const length = file.length;
                 const pathParts = file.path;
@@ -88,13 +133,21 @@ export async function process(
                 metadata[`info/files/${i}/length`] = String(length);
                 metadata[`info/files/${i}/path`] = pathStr;
                 i++;
-                if (i > 100) break; // Limit files
+                if (i > 100) break; // Limit files to prevent DoS
             }
+        } catch (e) {
+            console.debug(`[torrent] Error parsing torrent files: ${e}`);
+        }
+
+        // Set torrent name
+        const name = parsed.info?.name?.toString?.();
+        if (name) {
+            metadata['info/name'] = name;
         }
 
         await metaCore.mergeMetadata(cid, metadata);
 
-        // Add announce list to set
+        // Extract announce list (trackers) using add for RecordSet
         const announceList = parsed['announce-list'] || [];
         for (const tier of announceList) {
             for (const tracker of tier || []) {
@@ -104,12 +157,15 @@ export async function process(
             }
         }
 
+        console.log(`[torrent] Parsed torrent file: ${filePath}`);
+
         await sendCallback({
             taskId: request.taskId,
             status: 'completed',
             duration: Date.now() - startTime,
         });
     } catch (error) {
+        console.error(`[torrent] Error parsing torrent file ${request.filePath}:`, error);
         await sendCallback({
             taskId: request.taskId,
             status: 'failed',
