@@ -17,6 +17,15 @@ import bencode from 'bencode';
 import { FileType, FileNameVideoMetaExtractor, episodePatterns, seasonAndEpisodePatterns, seasonPatterns, extraEpKeyWords, keywordsArray, substringArray, soloEp } from '@metazla/filename-tools';
 import type { PluginManifest, ProcessRequest, CallbackPayload } from './types.js';
 import { MetaCoreClient } from './meta-core-client.js';
+import { createWebDAVClient, WebDAVClient } from './webdav-client.js';
+
+// Initialize WebDAV client if WEBDAV_URL is set
+const webdavClient = createWebDAVClient();
+if (webdavClient) {
+    console.log('[torrent] Using WebDAV for file access');
+} else {
+    console.log('[torrent] Using direct filesystem access');
+}
 
 const fileType = new FileType();
 const fileNameMetaExtractor = new FileNameVideoMetaExtractor(
@@ -73,7 +82,12 @@ export async function process(
         }
 
         // Read and parse torrent file
-        const torrentData = await readFile(filePath);
+        let torrentData: Buffer;
+        if (webdavClient) {
+            torrentData = await webdavClient.readFile(filePath);
+        } else {
+            torrentData = await readFile(filePath);
+        }
         const parsed = bencode.decode(torrentData, 'utf8') as Record<string, any>;
         const metadata: Record<string, string> = {};
 
@@ -157,7 +171,8 @@ export async function process(
             }
         }
 
-        console.log(`[torrent] Parsed torrent file: ${filePath}`);
+        const mode = webdavClient ? 'WebDAV' : 'filesystem';
+        console.log(`[torrent] Parsed torrent file: ${filePath} (${mode})`);
 
         await sendCallback({
             taskId: request.taskId,
